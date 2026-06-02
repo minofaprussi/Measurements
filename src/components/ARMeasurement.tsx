@@ -8,12 +8,20 @@ import InstructionPanel from "@/components/InstructionPanel";
 import ResultPanel from "@/components/ResultPanel";
 import { createMeasurementResult, distanceMeters, vecFromDOMPoint } from "@/lib/measurement";
 import { getXRSupportState } from "@/lib/xrSupport";
-import type { MeasurementPoint, MeasurementResult, Vec3, XRSupportState } from "@/types/measurement";
+import type { MeasurementPoint, MeasurementResult, Vec3, XRDebugInfo, XRSupportState } from "@/types/measurement";
 
 const checkingSupport: XRSupportState = {
   checked: false,
   supported: false,
-  message: "Checking AR support..."
+  status: "checking",
+  message: "Checking AR support...",
+  debug: {
+    userAgent: "",
+    isSecureContext: false,
+    navigatorXrExists: false,
+    immersiveArSupported: null,
+    platform: "unknown"
+  }
 };
 
 export default function ARMeasurement() {
@@ -36,10 +44,12 @@ export default function ARMeasurement() {
   const [trackingPoor, setTrackingPoor] = useState(false);
   const [instruction, setInstruction] = useState("Move your phone slowly to detect a surface.");
   const [status, setStatus] = useState("Checking AR support...");
+  const [lastXRError, setLastXRError] = useState("");
   const [points, setPoints] = useState<MeasurementPoint[]>([]);
   const [result, setResult] = useState<MeasurementResult | null>(null);
 
   const canStart = support.checked && support.supported && !isARActive;
+  const showDebug = process.env.NODE_ENV !== "production";
 
   useEffect(() => {
     let mounted = true;
@@ -62,18 +72,15 @@ export default function ARMeasurement() {
   }, [points.length]);
 
   async function startAR() {
-    if (typeof navigator === "undefined" || !navigator.xr || !containerRef.current) {
+    if (!canStart || typeof navigator === "undefined" || !navigator.xr || !containerRef.current) {
       setFallback(true);
       return;
     }
 
     try {
       setStatus("Requesting camera and AR session...");
-      const session = await navigator.xr.requestSession("immersive-ar", {
-        requiredFeatures: ["hit-test"],
-        optionalFeatures: ["dom-overlay", "local-floor"],
-        domOverlay: { root: document.body }
-      });
+      setLastXRError("");
+      const session = await requestARSession();
 
       const { renderer, scene, camera, reticle, markerGroup, controller } = createScene(containerRef.current);
       rendererRef.current = renderer;
@@ -94,9 +101,39 @@ export default function ARMeasurement() {
       setInstruction("Move your phone slowly to detect a surface.");
       setStatus("Surface not detected. Move phone slowly.");
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not start AR measurement.");
+      const message = readableXRError(error);
+      setLastXRError(message);
+      setSupport((current) => ({
+        ...current,
+        debug: {
+          ...current.debug,
+          lastXRErrorMessage: message
+        }
+      }) as XRSupportState);
+      setStatus(message);
       cleanupRenderer();
       setIsARActive(false);
+    }
+  }
+
+  async function requestARSession() {
+    if (typeof document === "undefined" || !navigator.xr) {
+      throw new Error("This browser does not support WebXR AR.");
+    }
+
+    try {
+      return await navigator.xr.requestSession("immersive-ar", {
+        requiredFeatures: ["hit-test"],
+        optionalFeatures: ["dom-overlay", "local-floor"],
+        domOverlay: { root: document.body }
+      });
+    } catch (error) {
+      const name = error instanceof DOMException ? error.name : error instanceof Error ? error.name : "";
+      if (name !== "NotSupportedError") throw error;
+      return navigator.xr.requestSession("immersive-ar", {
+        requiredFeatures: ["hit-test"],
+        optionalFeatures: ["local-floor"]
+      });
     }
   }
 
@@ -287,19 +324,30 @@ export default function ARMeasurement() {
           </header>
 
           <ARSupportMessage support={support} onFallback={() => setFallback(true)} />
+          {support.supported ? <AndroidRequirements /> : null}
           <InstructionPanel message={instruction} trackingPoor={trackingPoor} />
           <ResultPanel result={result} />
 
           <div className="grid gap-3 sm:grid-cols-3">
-            <button
-              type="button"
-              onClick={startAR}
-              disabled={!canStart}
-              className="flex items-center justify-center gap-2 bg-[var(--oxblood)] px-4 py-3 font-semibold text-white disabled:opacity-50"
-            >
-              <Camera className="size-4" />
-              Start AR Measurement
-            </button>
+            {support.supported ? (
+              <button
+                type="button"
+                onClick={startAR}
+                disabled={!canStart}
+                className="flex items-center justify-center gap-2 bg-[var(--oxblood)] px-4 py-3 font-semibold text-white disabled:opacity-50"
+              >
+                <Camera className="size-4" />
+                Start AR Measurement
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setFallback(true)}
+                className="flex items-center justify-center gap-2 bg-[var(--charcoal)] px-4 py-3 font-semibold text-white"
+              >
+                Use Image Measurement Instead
+              </button>
+            )}
             <button
               type="button"
               onClick={() => resetMeasurement()}
@@ -318,6 +366,7 @@ export default function ARMeasurement() {
               Exit AR
             </button>
           </div>
+          {showDebug ? <DeviceDebugPanel debug={{ ...support.debug, lastXRErrorMessage: lastXRError || support.debug.lastXRErrorMessage }} /> : null}
         </div>
 
         <section className="relative min-h-[520px] overflow-hidden border border-black/10 bg-black">
@@ -340,6 +389,54 @@ export default function ARMeasurement() {
         </section>
       </section>
     </main>
+  );
+}
+
+function readableXRError(error: unknown) {
+  const name = error instanceof DOMException ? error.name : error instanceof Error ? error.name : "UnknownError";
+  const detail = error instanceof Error ? error.message : "";
+
+  switch (name) {
+    case "NotSupportedError":
+      return "WebXR AR is not supported on this device. Install/update Google Play Services for AR and use Android Chrome.";
+    case "SecurityError":
+      return "AR requires HTTPS. Please use the deployed Vercel URL.";
+    case "NotAllowedError":
+      return "Camera permission required.";
+    case "InvalidStateError":
+      return "An AR session is already active. Exit AR and try again.";
+    default:
+      return detail || "Could not start AR measurement.";
+  }
+}
+
+function AndroidRequirements() {
+  return (
+    <section className="border border-black/10 bg-[#fffaf2]/85 p-5">
+      <p className="text-xs font-bold uppercase tracking-[0.16em] text-[var(--brass)]">Android AR checklist</p>
+      <ul className="mt-3 space-y-2 text-sm leading-6 text-black/65">
+        <li>Use Android phone</li>
+        <li>Open in Google Chrome</li>
+        <li>Update Chrome</li>
+        <li>Install/update Google Play Services for AR</li>
+        <li>Allow camera permission</li>
+        <li>Use HTTPS Vercel URL</li>
+      </ul>
+    </section>
+  );
+}
+
+function DeviceDebugPanel({ debug }: { debug: XRDebugInfo }) {
+  return (
+    <section className="border border-black/10 bg-[#fffaf2]/85 p-5 text-xs leading-5 text-black/65">
+      <p className="mb-2 font-bold uppercase tracking-[0.14em] text-[var(--brass)]">Device debug</p>
+      <p>Device type: {debug.platform}</p>
+      <p>Browser: {debug.userAgent}</p>
+      <p>HTTPS status: {debug.isSecureContext ? "secure" : "not secure"}</p>
+      <p>navigator.xr exists: {String(debug.navigatorXrExists)}</p>
+      <p>immersive-ar supported: {debug.immersiveArSupported === null ? "not checked" : String(debug.immersiveArSupported)}</p>
+      <p>Last XR error: {debug.lastXRErrorMessage || "none"}</p>
+    </section>
   );
 }
 
@@ -393,4 +490,3 @@ function createScene(container: HTMLDivElement) {
 
   return { renderer, scene, camera, reticle, markerGroup, controller };
 }
-

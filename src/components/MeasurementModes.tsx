@@ -1,21 +1,13 @@
 "use client";
 
 import { ChangeEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
-import { Camera, Crosshair, RefreshCw, Ruler, ShieldAlert } from "lucide-react";
+import { Camera, Ruler } from "lucide-react";
+import ProductionARMeasurement from "@/components/ARMeasurement";
 
 type Mode = "ar" | "image";
 type Point = { x: number; y: number };
 type DistanceResult = { meters: number; cm: number; inches: number; feet: number };
 type Accuracy = "High" | "Medium" | "Low";
-type GuideStep = "Move slowly" | "Detecting surface" | "Tap start point" | "Tap end point";
-type XRSessionLike = any;
-type XRReferenceSpaceLike = any;
-type XRHitTestSourceLike = any;
-type XRFrameLike = any;
-type XRViewerPoseLike = any;
-type XRHitTestResultLike = any;
-type XRInputSourceEventLike = any;
-type XRSystemLike = any;
 
 type ReferenceKey = "a4" | "creditCard" | "ruler" | "custom";
 
@@ -62,213 +54,9 @@ export default function MeasurementModes() {
           </div>
         </header>
 
-        {mode === "ar" ? <ARMeasurement /> : <CalibratedImageMeasurement />}
+        {mode === "ar" ? <ProductionARMeasurement /> : <CalibratedImageMeasurement />}
       </section>
     </main>
-  );
-}
-
-function ARMeasurement() {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const sessionRef = useRef<XRSessionLike | null>(null);
-  const referenceSpaceRef = useRef<XRReferenceSpaceLike | null>(null);
-  const hitTestSourceRef = useRef<XRHitTestSourceLike | null>(null);
-  const rendererRef = useRef<{ gl: WebGLRenderingContext; program: WebGLProgram } | null>(null);
-  const pointsRef = useRef<DOMPointReadOnly[]>([]);
-  const [supported, setSupported] = useState(false);
-  const [running, setRunning] = useState(false);
-  const [guide, setGuide] = useState<GuideStep>("Move slowly");
-  const [warning, setWarning] = useState("Start AR and move slowly so ARCore/ARKit can detect a horizontal or vertical plane.");
-  const [result, setResult] = useState<DistanceResult | null>(null);
-  const [pointCount, setPointCount] = useState(0);
-  const [trackingPoor, setTrackingPoor] = useState(false);
-
-  useEffect(() => {
-    let mounted = true;
-    if (typeof navigator !== "undefined" && "xr" in navigator) {
-      (navigator as Navigator & { xr?: { isSessionSupported: (mode: string) => Promise<boolean> } }).xr
-        ?.isSessionSupported("immersive-ar")
-        .then((value) => {
-          if (mounted) setSupported(value);
-        })
-        .catch(() => {
-          if (mounted) setSupported(false);
-        });
-    }
-    return () => {
-      mounted = false;
-    };
-  }, []);
-
-  async function startAR() {
-    if (typeof navigator === "undefined" || !("xr" in navigator)) {
-      setWarning("AR is not available in this browser. Use Chrome on Android with ARCore, or an ARKit/WebXR-capable browser on iOS.");
-      return;
-    }
-
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    try {
-      const xr = (navigator as Navigator & { xr: XRSystemLike }).xr;
-      const session = await xr.requestSession("immersive-ar", {
-        requiredFeatures: ["hit-test"],
-        optionalFeatures: ["dom-overlay", "plane-detection", "local-floor"],
-        domOverlay: { root: document.body }
-      });
-      sessionRef.current = session;
-      const gl = canvas.getContext("webgl", { xrCompatible: true } as WebGLContextAttributes) as (WebGLRenderingContext & { makeXRCompatible?: () => Promise<void> }) | null;
-      if (!gl) throw new Error("WebGL is required for AR.");
-      await gl.makeXRCompatible?.();
-      const program = createDotProgram(gl);
-      rendererRef.current = { gl, program };
-      await session.updateRenderState({ baseLayer: new (window as unknown as { XRWebGLLayer: any }).XRWebGLLayer(session, gl) });
-      const referenceSpace = await session.requestReferenceSpace("local-floor").catch(() => session.requestReferenceSpace("local"));
-      referenceSpaceRef.current = referenceSpace;
-      const viewerSpace = await session.requestReferenceSpace("viewer");
-      hitTestSourceRef.current = await session.requestHitTestSource?.({ space: viewerSpace }) ?? null;
-      if (!hitTestSourceRef.current) throw new Error("AR hit-test is not available.");
-
-      session.addEventListener("select", handleSelect);
-      session.addEventListener("end", () => {
-        hitTestSourceRef.current?.cancel();
-        hitTestSourceRef.current = null;
-        sessionRef.current = null;
-        setRunning(false);
-        setGuide("Move slowly");
-      });
-      setRunning(true);
-      setGuide("Detecting surface");
-      setWarning("Move slowly. Measurement is blocked until the tap raycast hits a valid plane.");
-      session.requestAnimationFrame(onXRFrame);
-    } catch (error) {
-      setWarning(error instanceof Error ? error.message : "Could not start AR.");
-    }
-  }
-
-  function onXRFrame(_time: DOMHighResTimeStamp, frame: XRFrameLike) {
-    const session = sessionRef.current;
-    const referenceSpace = referenceSpaceRef.current;
-    const hitTestSource = hitTestSourceRef.current;
-    if (!session || !referenceSpace || !hitTestSource) return;
-
-    const pose = frame.getViewerPose(referenceSpace);
-    const hits = frame.getHitTestResults(hitTestSource);
-    const poor = !pose || hits.length === 0;
-    setTrackingPoor(poor);
-    setGuide(hits.length ? (pointsRef.current.length ? "Tap end point" : "Tap start point") : "Detecting surface");
-    setWarning(poor ? "Tracking quality is poor. Move slowly and point at a clear horizontal or vertical surface." : "Plane detected. Tap start point, then tap end point.");
-    drawFrame(frame, pose, hits);
-    session.requestAnimationFrame(onXRFrame);
-  }
-
-  function drawFrame(frame: XRFrameLike, pose: XRViewerPoseLike | null, hits: XRHitTestResultLike[]) {
-    const session = sessionRef.current;
-    const renderer = rendererRef.current;
-    const referenceSpace = referenceSpaceRef.current;
-    if (!session || !renderer || !referenceSpace || !pose) return;
-    const { gl, program } = renderer;
-    const baseLayer = session.renderState.baseLayer;
-    if (!baseLayer) return;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, baseLayer.framebuffer);
-    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-
-    const hitPose = hits[0]?.getPose(referenceSpace);
-    if (!hitPose) return;
-    const view = pose.views[0];
-    const viewport = baseLayer.getViewport(view);
-    if (!viewport) return;
-    gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
-    drawPoint(gl, program, hitPose.transform.position, view.projectionMatrix, view.transform.inverse.matrix);
-  }
-
-  function handleSelect(event: XRInputSourceEventLike) {
-    const frame = event.frame;
-    const referenceSpace = referenceSpaceRef.current;
-    if (!referenceSpace) return;
-    const inputPose = frame.getPose(event.inputSource.targetRaySpace, referenceSpace);
-    if (!inputPose) {
-      setWarning("Tracking quality is poor. Retake the tap after moving slowly.");
-      return;
-    }
-    const hitSource = hitTestSourceRef.current;
-    if (!hitSource) {
-      setWarning("No valid plane raycast is available.");
-      return;
-    }
-    const hit = frame.getHitTestResults(hitSource)[0];
-    const hitPose = hit?.getPose(referenceSpace);
-    if (!hitPose) {
-      setWarning("No valid plane hit. Measurement blocked until a horizontal or vertical plane is detected.");
-      return;
-    }
-
-    const next = [...pointsRef.current, hitPose.transform.position].slice(-2);
-    pointsRef.current = next;
-    setPointCount(next.length);
-    setGuide(next.length === 1 ? "Tap end point" : "Tap start point");
-    if (next.length === 2) {
-      const meters = distance3d(next[0], next[1]);
-      setResult({ meters, cm: meters * 100, inches: meters * 39.3701, feet: meters * 3.28084 });
-      setWarning("Measurement captured from valid AR plane hit-test points.");
-    }
-  }
-
-  function resetMeasurement() {
-    pointsRef.current = [];
-    setPointCount(0);
-    setResult(null);
-    setGuide(running ? "Tap start point" : "Move slowly");
-    setWarning(running ? "Measurement reset. Tap a valid plane to start again." : "Start AR and move slowly to detect a surface.");
-  }
-
-  return (
-    <section className="grid gap-6 lg:grid-cols-[0.9fr_1.1fr]">
-      <div className="space-y-4">
-        <div className="border border-black/10 bg-[#fffaf2]/80 p-5">
-          <div className="mb-4 flex items-center gap-3">
-            <Crosshair className="size-5 text-[var(--brass)]" />
-            <h2 className="text-xl font-semibold">Mode 1: AR Measurement</h2>
-          </div>
-          <ol className="space-y-2 text-sm leading-6 text-black/65">
-            <li>1. Use an ARCore Android browser or ARKit/WebXR-capable iOS browser.</li>
-            <li>2. Move slowly until a horizontal or vertical plane is detected.</li>
-            <li>3. Tap the start point, then tap the end point.</li>
-            <li>4. If tracking quality is poor, retake the measurement.</li>
-          </ol>
-        </div>
-        <div className="border border-black/10 bg-[var(--charcoal)] p-5 text-white">
-          <p className="text-xs font-bold uppercase tracking-[0.16em] text-[var(--brass)]">Guide</p>
-          <p className="mt-2 text-2xl font-semibold">{guide}</p>
-          <p className="mt-3 text-sm leading-6 text-white/70">{warning}</p>
-          <p className="mt-2 text-sm text-white/60">Selected points: {pointCount}/2</p>
-        </div>
-      </div>
-
-      <div className="space-y-4">
-        <div className="relative min-h-[440px] overflow-hidden border border-black/10 bg-black">
-          <canvas ref={canvasRef} className="h-full min-h-[440px] w-full" />
-          <div className="absolute left-4 top-4 rounded bg-black/60 px-3 py-2 text-sm font-semibold text-white">
-            {trackingPoor ? "Tracking poor" : running ? "Tracking active" : supported ? "AR ready" : "AR support unknown"}
-          </div>
-        </div>
-        <div className="grid gap-3 sm:grid-cols-3">
-          <button type="button" onClick={startAR} disabled={!supported || running} className="bg-[var(--oxblood)] px-4 py-3 font-semibold text-white disabled:opacity-50">
-            Start AR
-          </button>
-          <button type="button" onClick={resetMeasurement} className="flex items-center justify-center gap-2 border border-black/15 px-4 py-3 font-semibold">
-            <RefreshCw className="size-4" />
-            Reset
-          </button>
-          <button type="button" onClick={() => sessionRef.current?.end()} disabled={!running} className="border border-black/15 px-4 py-3 font-semibold disabled:opacity-50">
-            Stop AR
-          </button>
-        </div>
-        <ResultPanel result={result} />
-      </div>
-    </section>
   );
 }
 
